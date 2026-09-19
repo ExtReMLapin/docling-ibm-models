@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 import docling_ibm_models.tableformer.utils.utils as u
+from docling_ibm_models.tableformer.models.table04_rs import graph_decoder
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
@@ -99,6 +100,67 @@ def _project_memory_kv(
 
 
 class TMTransformerDecoder(nn.TransformerDecoder):
+    def _graph_cache(
+        self,
+        tgt: Tensor,
+        memory: Optional[Tensor],
+        memory_mask: Optional[Tensor],
+        tgt_key_padding_mask: Optional[Tensor],
+        memory_key_padding_mask: Optional[Tensor],
+    ) -> Optional["graph_decoder.GraphDecoderCache"]:
+        """Set up CUDA graph decoding for a table, or return None to decline.
+
+        Declining is always safe: the caller then decodes through the regular
+        implementation, which this one has to agree with.
+        """
+        if not graph_decoder.graphs_enabled() or memory is None:
+            return None
+        if not (tgt.is_cuda and memory.is_cuda) or tgt.dtype != memory.dtype:
+            return None
+        if memory_mask is not None or tgt_key_padding_mask is not None:
+            return None
+        if memory_key_padding_mask is not None and bool(memory_key_padding_mask.any()):
+            # A mask that hides nothing is common here and harmless; a real one
+            # is not handled by the static path.
+            return None
+
+        attn = self.layers[0].self_attn
+        n_heads = attn.num_heads
+        dim = attn.embed_dim
+        if attn.in_proj_weight is None or dim % n_heads:
+            return None
+        if any(
+            layer.self_attn.in_proj_weight is None
+            or layer.multihead_attn.in_proj_weight is None
+            for layer in self.layers
+        ):
+            return None
+
+        pool = getattr(self, "_state_pool", None)
+        if pool is None:
+            pool = graph_decoder.StatePool()
+            self._state_pool = pool
+
+        bsz, memory_len = tgt.shape[1], memory.shape[0]
+        state = pool.get(
+            self.layers,
+            graph_decoder.INITIAL_CAPACITY,
+            bsz,
+            memory_len,
+            n_heads,
+            dim,
+            tgt.device,
+            tgt.dtype,
+        )
+        if state is None:
+            return None
+
+        state.reset()
+        state.set_memory(
+            [_project_memory_kv(layer, memory, n_heads) for layer in self.layers]
+        )
+        return graph_decoder.GraphDecoderCache(state, pool, self.layers, n_heads, dim)
+
     def forward(  # type: ignore
         self,
         tgt: Tensor,
@@ -118,7 +180,18 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
 
+        if isinstance(cache, graph_decoder.GraphDecoderCache):
+            cache.prepare()
+            # Only the newest tag matters: the prefix is already in the state.
+            return cache.decode(tgt[-1:]), cache  # type: ignore
+
         if cache is None:
+            graph_cache = self._graph_cache(
+                tgt, memory, memory_mask, tgt_key_padding_mask, memory_key_padding_mask
+            )
+            if graph_cache is not None:
+                graph_cache.prepare()
+                return graph_cache.decode(tgt[-1:]), graph_cache  # type: ignore
             cache = DecoderCache(
                 len(self.layers), tgt.shape[1], tgt.shape[2], tgt.device, tgt.dtype
             )
