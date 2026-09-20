@@ -3,6 +3,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 import docling_ibm_models.tableformer.utils.utils as u
@@ -31,12 +32,53 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def _project_memory_kv(
+    layer: "TMTransformerDecoderLayer", memory: Tensor, n_heads: int
+):
+    """Project the cross-attention keys/values of ``memory``, shaped for SDPA."""
+    attn = layer.multihead_attn
+    embed_dim = attn.embed_dim
+    head_dim = embed_dim // n_heads
+    weight, bias = attn.in_proj_weight, attn.in_proj_bias
+    # in_proj_weight stacks [Wq; Wk; Wv]
+    key = F.linear(
+        memory,
+        weight[embed_dim : 2 * embed_dim],
+        None if bias is None else bias[embed_dim : 2 * embed_dim],
+    )
+    value = F.linear(
+        memory,
+        weight[2 * embed_dim :],
+        None if bias is None else bias[2 * embed_dim :],
+    )
+    src_len, bsz, _ = key.shape
+    key = key.reshape(src_len, bsz * n_heads, head_dim).transpose(0, 1)
+    value = value.reshape(src_len, bsz * n_heads, head_dim).transpose(0, 1)
+    return key, value
+
+
+class DecoderCache:
+    """Decoding state of one table: the tag cache, and the memory projections.
+
+    ``tags`` is what the decoder used to hand back on its own. ``memory_kv`` is
+    what this cache exists for: ``memory`` does not change while a table is being
+    decoded, so its cross-attention keys and values are projected once instead of
+    once per tag and per layer.
+    """
+
+    __slots__ = ("tags", "memory_kv")
+
+    def __init__(self, memory_kv: list):
+        self.tags: Optional[Tensor] = None
+        self.memory_kv = memory_kv
+
+
 class TMTransformerDecoder(nn.TransformerDecoder):
     def forward(  # type: ignore
         self,
         tgt: Tensor,
         memory: Optional[Tensor] = None,
-        cache: Optional[Tensor] = None,
+        cache: Optional["DecoderCache"] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
@@ -45,30 +87,59 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         Args:
             tgt (Tensor): encoded tags. (tags_len,bsz,hidden_dim)
             memory (Tensor): encoded image (enc_image_size,bsz,hidden_dim)
-            cache (Optional[Tensor]): None during training, only used during inference.
+            cache (Optional[DecoderCache]): None during training and on the first
+                decoding step, then the state returned by the previous step.
         Returns:
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
+
+        if cache is None:
+            n_heads = self.layers[0].self_attn.num_heads
+            cache = DecoderCache(
+                []
+                if memory is None
+                else [_project_memory_kv(mod, memory, n_heads) for mod in self.layers]
+            )
 
         output = tgt
 
         # cache
         tag_cache = []
         for i, mod in enumerate(self.layers):
-            output = mod(output, memory)
+            output = mod(
+                output,
+                memory,
+                memory_kv=cache.memory_kv[i] if cache.memory_kv else None,
+            )
             tag_cache.append(output)
-            if cache is not None:
-                output = torch.cat([cache[i], output], dim=0)
+            if cache.tags is not None:
+                output = torch.cat([cache.tags[i], output], dim=0)
 
-        if cache is not None:
-            out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
+        if cache.tags is not None:
+            cache.tags = torch.cat([cache.tags, torch.stack(tag_cache, dim=0)], dim=1)
         else:
-            out_cache = torch.stack(tag_cache, dim=0)
+            cache.tags = torch.stack(tag_cache, dim=0)
 
-        return output, out_cache  # type: ignore
+        return output, cache  # type: ignore
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
+    def _cross_attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        """Cross-attention against keys/values projected once per table."""
+        attn = self.multihead_attn
+        embed_dim = attn.embed_dim
+        n_heads = attn.num_heads
+        head_dim = embed_dim // n_heads
+        weight, bias = attn.in_proj_weight, attn.in_proj_bias
+        query = F.linear(
+            query, weight[:embed_dim], None if bias is None else bias[:embed_dim]
+        )
+        tgt_len, bsz, _ = query.shape
+        query = query.reshape(tgt_len, bsz * n_heads, head_dim).transpose(0, 1)
+        attended = F.scaled_dot_product_attention(query, key, value)
+        attended = attended.transpose(0, 1).reshape(tgt_len, bsz, embed_dim)
+        return attn.out_proj(attended)
+
     def forward(  # type: ignore
         self,
         tgt: Tensor,
@@ -76,10 +147,13 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        memory_kv: Optional[tuple] = None,
     ) -> Tensor:
         """
         Args:
-            same as TMTransformerDecoder
+            same as TMTransformerDecoder, plus:
+            memory_kv: cross-attention keys and values already projected from
+                ``memory``, reused across the decoding steps of one table.
         Returns:
             Tensor:
                 During training (seq_len,bsz,hidden_dim)
@@ -101,14 +175,19 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_last_tok = self.norm1(tgt_last_tok)
 
         if memory is not None:
-            tmp_tgt = self.multihead_attn(
-                tgt_last_tok,
-                memory,
-                memory,
-                attn_mask=memory_mask,
-                key_padding_mask=memory_key_padding_mask,
-                need_weights=False,  # Optimization: Don't compute attention weights
-            )[0]
+            if memory_kv is not None:
+                tmp_tgt = self._cross_attention(
+                    tgt_last_tok, memory_kv[0], memory_kv[1]
+                )
+            else:
+                tmp_tgt = self.multihead_attn(
+                    tgt_last_tok,
+                    memory,
+                    memory,
+                    attn_mask=memory_mask,
+                    key_padding_mask=memory_key_padding_mask,
+                    need_weights=False,  # Optimization: Don't compute attention weights
+                )[0]
             tgt_last_tok = tgt_last_tok + self.dropout2(tmp_tgt)
             tgt_last_tok = self.norm2(tgt_last_tok)
 
