@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 import docling_ibm_models.tableformer.utils.utils as u
+from docling_ibm_models.tableformer.models.table04_rs import graph_decoder
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
@@ -74,6 +75,65 @@ class DecoderCache:
 
 
 class TMTransformerDecoder(nn.TransformerDecoder):
+    def _graph_cache(
+        self,
+        tgt: Tensor,
+        memory: Optional[Tensor],
+        memory_mask: Optional[Tensor],
+        tgt_key_padding_mask: Optional[Tensor],
+        memory_key_padding_mask: Optional[Tensor],
+    ) -> Optional["graph_decoder.GraphDecoderCache"]:
+        """Set up CUDA graph decoding for a table, or return None to decline.
+
+        Declining is always safe: the caller then decodes through the regular
+        implementation, which this one has to agree with.
+        """
+        if not graph_decoder.graphs_enabled() or memory is None:
+            return None
+        if not (tgt.is_cuda and memory.is_cuda) or tgt.dtype != memory.dtype:
+            return None
+        if memory_mask is not None or tgt_key_padding_mask is not None:
+            return None
+        if memory_key_padding_mask is not None and bool(memory_key_padding_mask.any()):
+            # A mask that hides nothing is common here and harmless; a real one
+            # is not handled by the static path.
+            return None
+
+        attn = self.layers[0].self_attn
+        n_heads, dim = attn.num_heads, attn.embed_dim
+        if dim % n_heads:
+            return None
+        if any(
+            layer.self_attn.in_proj_weight is None
+            or layer.multihead_attn.in_proj_weight is None
+            for layer in self.layers
+        ):
+            return None
+
+        pool = getattr(self, "_state_pool", None)
+        if pool is None:
+            pool = graph_decoder.StatePool()
+            self._state_pool = pool
+
+        state = pool.get(
+            self.layers,
+            graph_decoder.INITIAL_CAPACITY,
+            tgt.shape[1],
+            memory.shape[0],
+            n_heads,
+            dim,
+            tgt.device,
+            tgt.dtype,
+        )
+        if state is None:
+            return None
+
+        state.reset()
+        state.set_memory(
+            [_project_memory_kv(layer, memory, n_heads) for layer in self.layers]
+        )
+        return graph_decoder.GraphDecoderCache(state, pool, self.layers, n_heads, dim)
+
     def forward(  # type: ignore
         self,
         tgt: Tensor,
@@ -93,7 +153,19 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
 
+        if isinstance(cache, graph_decoder.GraphDecoderCache):
+            cache.prepare()
+            # Only the newest tag matters: the prefix is already in the buffers.
+            return cache.decode(tgt[-1:]), cache  # type: ignore
+
         if cache is None:
+            graphed = self._graph_cache(
+                tgt, memory, memory_mask, tgt_key_padding_mask, memory_key_padding_mask
+            )
+            if graphed is not None:
+                graphed.prepare()
+                return graphed.decode(tgt[-1:]), graphed  # type: ignore
+
             n_heads = self.layers[0].self_attn.num_heads
             cache = DecoderCache(
                 []
@@ -148,12 +220,17 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv: Optional[tuple] = None,
+        position: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
             same as TMTransformerDecoder, plus:
             memory_kv: cross-attention keys and values already projected from
-                ``memory``, reused across the decoding steps of one table.
+                ``memory``, reused across the decoding steps of one table. They
+                are enough on their own: ``memory`` may then be None.
+            position: index of the tag being decoded. Without it the tag is
+                taken to be the last of ``tgt``, which is no longer true when
+                ``tgt`` is a padded buffer.
         Returns:
             Tensor:
                 During training (seq_len,bsz,hidden_dim)
@@ -161,7 +238,10 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         """
 
         # From PyTorch but modified to only use the last tag
-        tgt_last_tok = tgt[-1:, :, :]
+        if position is None:
+            tgt_last_tok = tgt[-1:, :, :]
+        else:
+            tgt_last_tok = tgt.index_select(0, position)
 
         tmp_tgt = self.self_attn(
             tgt_last_tok,
@@ -174,20 +254,21 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_last_tok = tgt_last_tok + self.dropout1(tmp_tgt)
         tgt_last_tok = self.norm1(tgt_last_tok)
 
-        if memory is not None:
-            if memory_kv is not None:
-                tmp_tgt = self._cross_attention(
-                    tgt_last_tok, memory_kv[0], memory_kv[1]
-                )
-            else:
-                tmp_tgt = self.multihead_attn(
-                    tgt_last_tok,
-                    memory,
-                    memory,
-                    attn_mask=memory_mask,
-                    key_padding_mask=memory_key_padding_mask,
-                    need_weights=False,  # Optimization: Don't compute attention weights
-                )[0]
+        if memory_kv is not None:
+            tmp_tgt = self._cross_attention(tgt_last_tok, memory_kv[0], memory_kv[1])
+        elif memory is not None:
+            tmp_tgt = self.multihead_attn(
+                tgt_last_tok,
+                memory,
+                memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,  # Optimization: Don't compute attention weights
+            )[0]
+        else:
+            tmp_tgt = None
+
+        if tmp_tgt is not None:
             tgt_last_tok = tgt_last_tok + self.dropout2(tmp_tgt)
             tgt_last_tok = self.norm2(tgt_last_tok)
 
