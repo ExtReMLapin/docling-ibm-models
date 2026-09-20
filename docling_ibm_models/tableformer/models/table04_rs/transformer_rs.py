@@ -31,12 +31,49 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class DecoderCache:
+    """The decoded prefix of one table, in a buffer written in place.
+
+    The cache used to be rebuilt with two ``torch.cat`` calls per decoded tag,
+    copying the whole prefix every step. Here it lives in a buffer allocated
+    once and grown by doubling; the prefix handed to the next layer is a view
+    into it, and each position is written exactly once.
+    """
+
+    __slots__ = ("buffer", "step")
+
+    INITIAL_CAPACITY = 64
+
+    def __init__(self, num_layers: int, bsz: int, dim: int, device, dtype):
+        self.buffer = torch.empty(
+            (num_layers, self.INITIAL_CAPACITY, bsz, dim), device=device, dtype=dtype
+        )
+        self.step = 0
+
+    def _grow(self) -> None:
+        num_layers, capacity, bsz, dim = self.buffer.shape
+        grown = torch.empty(
+            (num_layers, 2 * capacity, bsz, dim),
+            device=self.buffer.device,
+            dtype=self.buffer.dtype,
+        )
+        grown[:, :capacity] = self.buffer
+        self.buffer = grown
+
+    def append(self, layer: int, output: Tensor) -> Tensor:
+        """Store this layer's output for the current step and return the prefix."""
+        if self.step >= self.buffer.shape[1]:
+            self._grow()
+        self.buffer[layer, self.step] = output[0]
+        return self.buffer[layer, : self.step + 1]
+
+
 class TMTransformerDecoder(nn.TransformerDecoder):
     def forward(  # type: ignore
         self,
         tgt: Tensor,
         memory: Optional[Tensor] = None,
-        cache: Optional[Tensor] = None,
+        cache: Optional["DecoderCache"] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
@@ -45,27 +82,27 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         Args:
             tgt (Tensor): encoded tags. (tags_len,bsz,hidden_dim)
             memory (Tensor): encoded image (enc_image_size,bsz,hidden_dim)
-            cache (Optional[Tensor]): None during training, only used during inference.
+            cache (Optional[DecoderCache]): None during training and on the first
+                decoding step, then the state returned by the previous step.
         Returns:
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
 
+        if cache is None:
+            cache = DecoderCache(
+                len(self.layers), tgt.shape[1], tgt.shape[2], tgt.device, tgt.dtype
+            )
+
         output = tgt
 
         # cache
-        tag_cache = []
         for i, mod in enumerate(self.layers):
             output = mod(output, memory)
-            tag_cache.append(output)
-            if cache is not None:
-                output = torch.cat([cache[i], output], dim=0)
+            output = cache.append(i, output)
 
-        if cache is not None:
-            out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
-        else:
-            out_cache = torch.stack(tag_cache, dim=0)
+        cache.step += 1
 
-        return output, out_cache  # type: ignore
+        return output, cache  # type: ignore
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
