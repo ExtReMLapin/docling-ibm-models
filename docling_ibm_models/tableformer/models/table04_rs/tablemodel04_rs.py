@@ -9,6 +9,7 @@ from docling_ibm_models.tableformer.models.table04_rs.bbox_decoder_rs import BBo
 from docling_ibm_models.tableformer.models.table04_rs.encoder04_rs import Encoder04
 from docling_ibm_models.tableformer.models.table04_rs.transformer_rs import (
     Tag_Transformer,
+    TagDecoderCache,
 )
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
@@ -85,6 +86,8 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._encoder_dim,
             self._dropout,
         ).to(device)
+        # Created on first predict(), once the weights are loaded
+        self._tag_decoder_cache = None
 
     _logger = None
 
@@ -158,11 +161,15 @@ class TableModel04_rs(BaseModel, nn.Module):
         encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
         AggProfiler().end("model_tag_transformer_encoder", self._prof)
 
-        decoded_tags = (
-            torch.LongTensor([word_map["<start>"]]).to(self._device).unsqueeze(1)
-        )
+        if self._tag_decoder_cache is None:
+            self._tag_decoder_cache = TagDecoderCache(
+                self._tag_transformer, self._max_pred_len + 1
+            )
+        tag_decoder = self._tag_decoder_cache
+        tag_decoder.set_memory(encoder_out)
+
+        seq = [word_map["<start>"]]
         output_tags = []
-        cache = None
         tag_H_buf = []
 
         skip_next_tag = True
@@ -177,23 +184,9 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # i = 0
         while len(output_tags) < self._max_pred_len:
-            decoded_embedding = self._tag_transformer._embedding(decoded_tags)
-            decoded_embedding = self._tag_transformer._positional_encoding(
-                decoded_embedding
-            )
             AggProfiler().begin("model_tag_transformer_decoder", self._prof)
-            decoded, cache = self._tag_transformer._decoder(
-                decoded_embedding,
-                encoder_out,
-                cache,
-                memory_key_padding_mask=encoder_mask,
-            )
+            new_tag, last_H = tag_decoder.step(seq[-1], len(seq) - 1)
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
-            # Grab last feature to produce token
-            AggProfiler().begin("model_tag_transformer_fc", self._prof)
-            logits = self._tag_transformer._fc(decoded[-1, :, :])  # 1, vocab_size
-            AggProfiler().end("model_tag_transformer_fc", self._prof)
-            new_tag = logits.argmax(1).item()
 
             # STRUCTURE ERROR CORRECTION
             # Correction for first line xcel...
@@ -209,13 +202,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             # End of generation
             if new_tag == word_map["<end>"]:
                 output_tags.append(new_tag)
-                decoded_tags = torch.cat(
-                    [
-                        decoded_tags,
-                        torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
-                    ],
-                    dim=0,
-                )  # current_output_len, 1
+                seq.append(new_tag)
                 break
             output_tags.append(new_tag)
 
@@ -233,7 +220,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                     word_map["ucel"],
                 ]:
                     # GENERATE BBOX HERE TOO (All other cases)...
-                    tag_H_buf.append(decoded[-1, :, :])
+                    tag_H_buf.append(last_H)
                     if first_lcel is not True:
                         # Mark end index for horizontal cell bbox merge
                         bboxes_to_merge[cur_bbox_ind] = bbox_ind
@@ -245,7 +232,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             else:
                 if first_lcel:
                     # GENERATE BBOX HERE (Beginning of horisontal span)...
-                    tag_H_buf.append(decoded[-1, :, :])
+                    tag_H_buf.append(last_H)
                     first_lcel = False
                     # Mark start index for cell bbox merge
                     cur_bbox_ind = bbox_ind
@@ -263,14 +250,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             else:
                 prev_tag_ucel = False
 
-            decoded_tags = torch.cat(
-                [
-                    decoded_tags,
-                    torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
-                ],
-                dim=0,
-            )  # current_output_len, 1
-        seq = decoded_tags.squeeze().tolist()
+            seq.append(new_tag)
 
         if self._bbox:
             AggProfiler().begin("model_bbox_decoder", self._prof)
