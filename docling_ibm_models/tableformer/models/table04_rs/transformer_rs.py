@@ -202,140 +202,81 @@ class Tag_Transformer(nn.Module):
         return predictions, decode_lengths
 
 
-def _single_query_attention(
-    q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
-) -> Tensor:
-    # q: (1, H, 1, D). Plain matmuls: SDPA's memory-efficient kernel tiles 64
-    # queries per block, so with a single query it runs only H blocks.
-    scores = torch.matmul(q, k.transpose(-1, -2)) * (q.size(-1) ** -0.5)
-    if mask is not None:
-        scores = scores.masked_fill(~mask, float("-inf"))
-    return torch.matmul(scores.softmax(-1), v)
-
-
 class TagDecoderCache:
     """
-    Incremental tag decoding for inference, one tag at a time.
-
-    Same result as running TMTransformerDecoder (eval mode) on the whole tag
-    sequence at each step, but each layer's self-attention keys/values and the
-    memory keys/values are kept, so a step only processes the new tag.
-    On CUDA the step is captured once in a CUDA graph and replayed.
-    Not thread-safe: use one instance per model and thread.
+    Inference-only incremental TMTransformerDecoder: keeps each layer's keys/values
+    so a step only processes the new tag. On CUDA the step is a CUDA graph.
     """
 
-    def __init__(self, tag_transformer: "Tag_Transformer", max_len: int):
-        self._tt = tag_transformer
-        self._layers = list(tag_transformer._decoder.layers)
+    def __init__(self, tt: "Tag_Transformer", max_len: int):
+        self._tt, self._layers = tt, tt._decoder.layers
         attn = self._layers[0].self_attn
-        self._n_heads = attn.num_heads
-        self._head_dim = attn.embed_dim // attn.num_heads
-        self._max_len = max_len
-
-        weight = tag_transformer._fc.weight
-        device = weight.device
-        shape = (len(self._layers), 1, self._n_heads, max_len, self._head_dim)
-        self._k = torch.zeros(shape, device=device, dtype=weight.dtype)
+        E, H, L = attn.embed_dim, attn.num_heads, len(self._layers)
+        dev = tt._fc.weight.device
+        self._heads = lambda t: t.unflatten(-1, (H, E // H)).permute(1, 2, 0, 3)
+        self._k = torch.zeros(L, 1, H, max_len, E // H, device=dev)
         self._v = torch.zeros_like(self._k)
-        self._memory_k: Optional[Tensor] = None
-        self._memory_v: Optional[Tensor] = None
-
-        # Static inputs/outputs of the CUDA graph
-        self._use_graph = device.type == "cuda"
+        mem = (L, 1, H, tt._enc_image_size**2, E // H)
+        self._mem_k, self._mem_v = torch.zeros(mem, device=dev), torch.zeros(
+            mem, device=dev
+        )
+        self._tag = torch.zeros(1, dtype=torch.long, device=dev)
+        self._pos = torch.zeros(1, dtype=torch.long, device=dev)
+        self._positions = torch.arange(max_len, device=dev)
         self._graph: Optional[torch.cuda.CUDAGraph] = None
-        self._tag = torch.zeros(1, dtype=torch.long, device=device)
-        self._pos = torch.zeros(1, dtype=torch.long, device=device)
-        self._positions = torch.arange(max_len, device=device)
-        self._out_tag: Optional[Tensor] = None
-        self._out_H: Optional[Tensor] = None
-
-    def _heads(self, t: Tensor) -> Tensor:  # (L, 1, E) -> (1, H, L, D)
-        return t.unflatten(-1, (self._n_heads, self._head_dim)).permute(1, 2, 0, 3)
 
     def set_memory(self, memory: Tensor):
-        r"""
-        memory: encoder output (positions, 1, embed_dim)
-        """
-        mem_k, mem_v = [], []
-        for layer in self._layers:
+        for i, layer in enumerate(self._layers):
             attn = layer.multihead_attn
             E = attn.embed_dim
-            k, v = F.linear(
-                memory, attn.in_proj_weight[E:], attn.in_proj_bias[E:]
-            ).chunk(2, dim=-1)
-            mem_k.append(self._heads(k))
-            mem_v.append(self._heads(v))
-        k, v = torch.stack(mem_k), torch.stack(mem_v)
-        if (
-            self._memory_k is not None
-            and self._memory_v is not None
-            and self._memory_k.shape == k.shape
-        ):
-            # The CUDA graph reads these buffers: update them in place
-            self._memory_k.copy_(k)
-            self._memory_v.copy_(v)
-        else:
-            self._memory_k, self._memory_v = k, v
-            self._graph = None
+            w, b = attn.in_proj_weight[E:], attn.in_proj_bias[E:]
+            k, v = F.linear(memory, w, b).chunk(2, dim=-1)
+            self._mem_k[i].copy_(self._heads(k))
+            self._mem_v[i].copy_(self._heads(v))
 
-    def _forward(self, tag: Tensor, pos: Tensor, num_keys: Optional[int]):
-        memory_k, memory_v = self._memory_k, self._memory_v
-        assert memory_k is not None and memory_v is not None, "call set_memory()"
-        mask = None
-        if num_keys is None:  # graph: static shapes, mask the unused positions
-            mask = (self._positions <= pos).view(1, 1, 1, -1)
-        x = self._tt._embedding(tag.view(1, 1))
+    def _attend(self, attn, q, k, v, mask=None):
+        # Plain matmuls: SDPA's kernels tile many queries per block, slow for one
+        scores = self._heads(q) @ k.transpose(-1, -2) * k.size(-1) ** -0.5
+        if mask is not None:
+            scores = scores.masked_fill(~mask, float("-inf"))
+        out = scores.softmax(-1) @ v
+        return attn.out_proj(out.permute(2, 0, 1, 3).flatten(-2))
+
+    def _forward(self):
+        pos, mask = self._pos, (self._positions <= self._pos).view(1, 1, 1, -1)
+        x = self._tt._embedding(self._tag.view(1, 1))
         x = x + self._tt._positional_encoding.pe.index_select(0, pos)
         for i, layer in enumerate(self._layers):
-            attn = layer.self_attn
-            q, k, v = F.linear(x, attn.in_proj_weight, attn.in_proj_bias).chunk(
-                3, dim=-1
-            )
+            sa, ca = layer.self_attn, layer.multihead_attn
+            q, k, v = F.linear(x, sa.in_proj_weight, sa.in_proj_bias).chunk(3, -1)
             self._k[i].index_copy_(2, pos, self._heads(k))
             self._v[i].index_copy_(2, pos, self._heads(v))
-            keys, values = self._k[i], self._v[i]
-            if num_keys is not None:
-                keys, values = keys[:, :, :num_keys], values[:, :, :num_keys]
-            out = _single_query_attention(self._heads(q), keys, values, mask)
-            x = layer.norm1(x + attn.out_proj(out.permute(2, 0, 1, 3).flatten(-2)))
-
-            attn = layer.multihead_attn
-            E = attn.embed_dim
-            q = F.linear(x, attn.in_proj_weight[:E], attn.in_proj_bias[:E])
-            out = _single_query_attention(self._heads(q), memory_k[i], memory_v[i])
-            x = layer.norm2(x + attn.out_proj(out.permute(2, 0, 1, 3).flatten(-2)))
-
+            x = layer.norm1(x + self._attend(sa, q, self._k[i], self._v[i], mask))
+            q = F.linear(
+                x, ca.in_proj_weight[: ca.embed_dim], ca.in_proj_bias[: ca.embed_dim]
+            )
+            x = layer.norm2(x + self._attend(ca, q, self._mem_k[i], self._mem_v[i]))
             x = layer.norm3(x + layer.linear2(layer.activation(layer.linear1(x))))
-        last_H = x[0]  # (1, embed_dim)
-        return self._tt._fc(last_H).argmax(1), last_H
-
-    def _capture(self):
-        stream = torch.cuda.Stream(self._pos.device)
-        stream.wait_stream(torch.cuda.current_stream(self._pos.device))
-        with torch.cuda.stream(stream):
-            for _ in range(2):  # warm up before capture
-                self._forward(self._tag, self._pos, None)
-        torch.cuda.current_stream(self._pos.device).wait_stream(stream)
-        self._graph = torch.cuda.CUDAGraph()
-        # thread_local: other pipeline threads may use CUDA during the capture
-        with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):
-            self._out_tag, self._out_H = self._forward(self._tag, self._pos, None)
+        self._out_H = x[0]
+        self._out_tag = self._tt._fc(self._out_H).argmax(1)
 
     def step(self, tag: int, pos: int):
-        r"""
-        Feed `tag` at position `pos` and return (predicted next tag, last hidden state)
-        """
-        if not self._use_graph:
-            device = self._k.device
-            tag_t = torch.tensor([tag], device=device)
-            pos_t = torch.tensor([pos], device=device)
-            new_tag, last_H = self._forward(tag_t, pos_t, pos + 1)
-            return int(new_tag.item()), last_H
-        if self._graph is None:
-            self._capture()
-        assert self._graph is not None
-        assert self._out_tag is not None and self._out_H is not None
+        """Feed `tag` at `pos`, return (next tag, last hidden state)."""
         self._tag.fill_(tag)
         self._pos.fill_(pos)
+        if self._k.device.type != "cuda":
+            self._forward()
+            return int(self._out_tag.item()), self._out_H
+        if self._graph is None:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):  # warm up before capture
+                self._forward()
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            # thread_local: other pipeline threads may use CUDA during the capture
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                self._forward()
+            self._graph = graph
         self._graph.replay()
         return int(self._out_tag.item()), self._out_H.clone()
