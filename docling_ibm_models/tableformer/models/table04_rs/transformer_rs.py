@@ -1,5 +1,6 @@
 import logging
 import math
+import threading
 from typing import Optional
 
 import torch
@@ -202,6 +203,9 @@ class Tag_Transformer(nn.Module):
         return predictions, decode_lengths
 
 
+_CAPTURE_LOCK = threading.Lock()
+
+
 class TagDecoderCache:
     """
     Inference-only incremental TMTransformerDecoder: keeps each layer's keys/values
@@ -268,15 +272,20 @@ class TagDecoderCache:
             self._forward()
             return int(self._out_tag.item()), self._out_H
         if self._graph is None:
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):  # warm up before capture
-                self._forward()
-            torch.cuda.current_stream().wait_stream(s)
-            graph = torch.cuda.CUDAGraph()
-            # thread_local: other pipeline threads may use CUDA during the capture
-            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-                self._forward()
-            self._graph = graph
+            # Captures sync the device: run them one at a time across threads
+            with _CAPTURE_LOCK:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):  # warm up before capture
+                    self._forward()
+                torch.cuda.current_stream().wait_stream(s)
+                graph = torch.cuda.CUDAGraph()
+                # Own stream: the default capture stream is shared by all threads.
+                # thread_local: other pipeline threads may use CUDA during the capture
+                with torch.cuda.graph(
+                    graph, stream=s, capture_error_mode="thread_local"
+                ):
+                    self._forward()
+                self._graph = graph
         self._graph.replay()
         return int(self._out_tag.item()), self._out_H.clone()
